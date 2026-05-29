@@ -1,13 +1,15 @@
-# Finance Strategy Trend Analyzer
+# Finance Strategy Backtester
 
-這個 Streamlit app 使用手動上傳 CSV 的方式運作，不會自動連線抓取 Google Trends 或股票價格資料，也不需要 `pytrends`。
+這是一個 Streamlit 單頁網站。使用者輸入股票代碼後，系統會從 Yahoo Finance 取得股價資料，並可勾選 Google Trends、MACD、RSI 三種指標中的任意組合進行回測。
 
 ## 功能
 
-- 上傳 Google Trends CSV，分析關鍵字熱度、動能、波動與策略優先級。
-- 上傳股票價格 CSV，使用 MACD + RSI 產生買賣訊號並進行回測。
-- 顯示策略總報酬、買進持有報酬、最大回撤、Sharpe、交易次數與交易紀錄。
-- 可下載趨勢摘要與回測明細 CSV。
+- 股票代碼輸入，例如 `AAPL`、`TSLA`、`2330.TW`
+- Yahoo Finance 自動取得股價資料
+- Google Trends 維持手動上傳 CSV，不自動抓取 Google Trends
+- 可勾選使用 Google Trends、MACD、RSI
+- 顯示策略報酬、買進持有報酬、年化報酬、最大回撤、Sharpe、交易次數
+- 顯示價格訊號、資金曲線、MACD、RSI、Google Trends 圖表
 
 ## 執行方式
 
@@ -22,7 +24,7 @@ streamlit run app.py
 2. 到 Streamlit Community Cloud 建立新 app。
 3. Repository 選擇你的 GitHub repo。
 4. Main file path 填入 `app.py`。
-5. Deploy 後網站會以手動上傳 CSV 的方式運作。
+5. Deploy。
 
 ## Google Trends CSV 格式
 
@@ -36,14 +38,3 @@ date,AI finance,ETF,interest rate
 ```
 
 第一欄需是日期欄，欄名可為 `date`、`day`、`week`、`month` 或 `time`；後續欄位會被視為關鍵字或主題。
-
-## 股票價格 CSV 格式
-
-股票回測至少需要 `date` 與 `close` 欄位，也可包含 `open`、`high`、`low`、`volume`。
-
-```csv
-date,open,high,low,close,volume
-2026-01-02,100,103,99,102,1200000
-2026-01-03,102,105,101,104,980000
-2026-01-04,104,106,103,105,1130000
-```

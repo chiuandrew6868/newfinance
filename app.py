@@ -1,452 +1,341 @@
 import io
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
 
 @dataclass
-class TrendSummary:
-    keyword: str
-    latest: float
-    previous: float
-    average: float
-    momentum: float
-    volatility: float
-    score: float
-    recommendation: str
+class BacktestMetrics:
+    total_return: float
+    buy_hold_return: float
+    annual_return: float
+    max_drawdown: float
+    sharpe: float
+    trades: int
+    final_equity: float
 
 
 def find_header_row(raw_csv: bytes) -> int:
     preview = raw_csv.decode("utf-8-sig", errors="ignore").splitlines()
-    date_labels = {"date", "day", "week", "month", "time"}
-
     for index, line in enumerate(preview[:30]):
         first_cell = line.split(",", 1)[0].strip().lower()
-        if first_cell in date_labels:
+        if first_cell in {"date", "day", "week", "month", "time"}:
             return index
     return 0
 
 
 def load_trends_csv(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.getvalue()
-    header_row = find_header_row(raw)
-    df = pd.read_csv(io.BytesIO(raw), skiprows=header_row)
+    df = pd.read_csv(io.BytesIO(raw), skiprows=find_header_row(raw))
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
 
     if df.empty or len(df.columns) < 2:
-        raise ValueError("CSV 至少需要一個日期欄位與一個關鍵字數值欄位。")
+        raise ValueError("CSV 至少需要一個日期欄位與一個趨勢數值欄位。")
 
-    date_column = df.columns[0]
-    df = df.rename(columns={date_column: "date"})
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.rename(columns={df.columns[0]: "date"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
     df = df.dropna(subset=["date"]).sort_values("date")
 
-    value_columns = [column for column in df.columns if column != "date"]
-    for column in value_columns:
-        df[column] = (
+    for column in [column for column in df.columns if column != "date"]:
+        cleaned = (
             df[column]
             .astype(str)
             .str.replace("<1", "0.5", regex=False)
             .str.replace(",", "", regex=False)
             .str.extract(r"([-+]?\d*\.?\d+)", expand=False)
         )
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+        df[column] = pd.to_numeric(cleaned, errors="coerce")
 
-    df = df[["date"] + value_columns].dropna(axis=1, how="all")
+    df = df.dropna(axis=1, how="all")
     if len(df.columns) < 2:
-        raise ValueError("找不到可分析的 Google Trends 數值欄位。")
-
+        raise ValueError("找不到可用的 Google Trends 數值欄位。")
     return df
 
 
-def normalize(series: pd.Series) -> pd.Series:
-    minimum = series.min()
-    maximum = series.max()
-    if pd.isna(minimum) or pd.isna(maximum) or maximum == minimum:
-        return pd.Series(50, index=series.index, dtype=float)
-    return (series - minimum) / (maximum - minimum) * 100
+@st.cache_data(ttl=60 * 30)
+def fetch_stock_data(ticker: str, start: date, end: date) -> pd.DataFrame:
+    data = yf.download(
+        ticker,
+        start=start,
+        end=end + timedelta(days=1),
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+
+    if data.empty:
+        raise ValueError("Yahoo Finance 沒有回傳資料，請確認股票代碼與日期區間。")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    data = data.reset_index()
+    data.columns = [str(column).lower().replace(" ", "_") for column in data.columns]
+    data = data.rename(columns={"adj_close": "close"})
+
+    keep_columns = [column for column in ["date", "open", "high", "low", "close", "volume"] if column in data]
+    data = data[keep_columns].dropna(subset=["date", "close"])
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.tz_localize(None)
+    data["close"] = pd.to_numeric(data["close"], errors="coerce")
+    data = data.dropna(subset=["date", "close"]).sort_values("date")
+
+    if len(data) < 60:
+        raise ValueError("資料筆數不足，請拉長回測期間。")
+    return data
 
 
-def build_summary(df: pd.DataFrame, lookback: int) -> pd.DataFrame:
-    summaries: list[TrendSummary] = []
-
-    for keyword in [column for column in df.columns if column != "date"]:
-        series = df[keyword].dropna()
-        if series.empty:
-            continue
-
-        window = series.tail(max(2, lookback))
-        latest = float(window.iloc[-1])
-        previous = float(window.iloc[-2]) if len(window) >= 2 else latest
-        average = float(window.mean())
-        momentum = latest - average
-        volatility = float(window.std(ddof=0)) if len(window) > 1 else 0.0
-        trend_strength = latest + momentum - volatility * 0.25
-
-        if trend_strength >= 75:
-            recommendation = "積極投入"
-        elif trend_strength >= 55:
-            recommendation = "加碼觀察"
-        elif trend_strength >= 35:
-            recommendation = "維持測試"
-        else:
-            recommendation = "降低優先"
-
-        summaries.append(
-            TrendSummary(
-                keyword=keyword,
-                latest=latest,
-                previous=previous,
-                average=average,
-                momentum=momentum,
-                volatility=volatility,
-                score=trend_strength,
-                recommendation=recommendation,
-            )
-        )
-
-    summary_df = pd.DataFrame([summary.__dict__ for summary in summaries])
-    if summary_df.empty:
-        return summary_df
-
-    summary_df["score"] = normalize(summary_df["score"])
-    return summary_df.sort_values("score", ascending=False)
-
-
-def build_long_table(df: pd.DataFrame) -> pd.DataFrame:
-    return df.melt("date", var_name="keyword", value_name="interest").dropna()
-
-
-def load_stock_csv(uploaded_file) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file)
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    column_map = {column.lower().strip(): column for column in df.columns}
-
-    date_column = next((column_map[name] for name in ["date", "datetime", "time"] if name in column_map), None)
-    close_column = next((column_map[name] for name in ["close", "adj close", "adj_close", "price"] if name in column_map), None)
-
-    if date_column is None or close_column is None:
-        raise ValueError("股票 CSV 需要日期欄位 date 與收盤價欄位 close 或 adj close。")
-
-    result = df.rename(columns={date_column: "date", close_column: "close"}).copy()
-    result["date"] = pd.to_datetime(result["date"], errors="coerce")
-    result["close"] = pd.to_numeric(result["close"], errors="coerce")
-
-    optional_columns = {}
-    for target, names in {
-        "open": ["open"],
-        "high": ["high"],
-        "low": ["low"],
-        "volume": ["volume"],
-    }.items():
-        source = next((column_map[name] for name in names if name in column_map), None)
-        if source:
-            optional_columns[source] = target
-
-    result = result.rename(columns=optional_columns)
-    keep_columns = [column for column in ["date", "open", "high", "low", "close", "volume"] if column in result.columns]
-    result = result[keep_columns].dropna(subset=["date", "close"]).sort_values("date")
-
-    if len(result) < 35:
-        raise ValueError("資料筆數不足，MACD 與 RSI 回測建議至少 35 筆以上。")
-
-    return result
-
-
-def add_indicators(
-    df: pd.DataFrame,
-    fast: int,
-    slow: int,
-    signal: int,
-    rsi_period: int,
-) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame, trend_df: pd.DataFrame | None = None, trend_column: str | None = None) -> pd.DataFrame:
     result = df.copy()
     close = result["close"]
 
-    result["ema_fast"] = close.ewm(span=fast, adjust=False).mean()
-    result["ema_slow"] = close.ewm(span=slow, adjust=False).mean()
-    result["macd"] = result["ema_fast"] - result["ema_slow"]
-    result["macd_signal"] = result["macd"].ewm(span=signal, adjust=False).mean()
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=26, adjust=False).mean()
+    result["macd"] = ema_fast - ema_slow
+    result["macd_signal"] = result["macd"].ewm(span=9, adjust=False).mean()
     result["macd_hist"] = result["macd"] - result["macd_signal"]
+    result["macd_bullish"] = result["macd"] > result["macd_signal"]
 
     delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / rsi_period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / rsi_period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    result["rsi"] = 100 - (100 / (1 + rs))
-    result["rsi"] = result["rsi"].fillna(50)
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    result["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+    result["rsi_bullish"] = (result["rsi"] >= 50) & (result["rsi"] <= 75)
+
+    if trend_df is not None and trend_column:
+        trend = trend_df[["date", trend_column]].rename(columns={trend_column: "trend_interest"}).dropna()
+        trend["trend_ma"] = trend["trend_interest"].rolling(4, min_periods=1).mean()
+        merged = pd.merge_asof(
+            result.sort_values("date"),
+            trend.sort_values("date"),
+            on="date",
+            direction="backward",
+        )
+        result["trend_interest"] = merged["trend_interest"]
+        result["trend_ma"] = merged["trend_ma"]
+        result["trend_bullish"] = merged["trend_interest"] >= merged["trend_ma"]
+    else:
+        result["trend_interest"] = np.nan
+        result["trend_ma"] = np.nan
+        result["trend_bullish"] = False
 
     return result
 
 
-def backtest_macd_rsi(
+def build_combined_signal(df: pd.DataFrame, use_trend: bool, use_macd: bool, use_rsi: bool) -> pd.Series:
+    signals = []
+    if use_trend:
+        signals.append(df["trend_bullish"].fillna(False))
+    if use_macd:
+        signals.append(df["macd_bullish"].fillna(False))
+    if use_rsi:
+        signals.append(df["rsi_bullish"].fillna(False))
+
+    if not signals:
+        return pd.Series(False, index=df.index)
+
+    combined = signals[0].copy()
+    for signal in signals[1:]:
+        combined = combined & signal
+    return combined
+
+
+def run_backtest(
     df: pd.DataFrame,
-    rsi_buy: int,
-    rsi_sell: int,
+    use_trend: bool,
+    use_macd: bool,
+    use_rsi: bool,
     initial_cash: float,
     fee_rate: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, BacktestMetrics]:
     result = df.copy()
-    macd_cross_up = (result["macd"] > result["macd_signal"]) & (result["macd"].shift(1) <= result["macd_signal"].shift(1))
-    macd_cross_down = (result["macd"] < result["macd_signal"]) & (result["macd"].shift(1) >= result["macd_signal"].shift(1))
-    result["buy_signal"] = macd_cross_up & (result["rsi"] <= rsi_buy)
-    result["sell_signal"] = macd_cross_down | (result["rsi"] >= rsi_sell)
+    result["signal"] = build_combined_signal(result, use_trend, use_macd, use_rsi)
+    result["position"] = result["signal"].shift(1).fillna(False).astype(int)
+    result["daily_return"] = result["close"].pct_change().fillna(0)
 
-    cash = initial_cash
-    shares = 0.0
-    position = 0
     trades = []
-    equity_values = []
-
+    previous_position = 0
     for _, row in result.iterrows():
-        price = float(row["close"])
+        position = int(row["position"])
+        if position != previous_position:
+            trades.append(
+                {
+                    "date": row["date"],
+                    "action": "Buy" if position == 1 else "Sell",
+                    "price": row["close"],
+                }
+            )
+        previous_position = position
 
-        if position == 0 and bool(row["buy_signal"]):
-            shares = cash * (1 - fee_rate) / price
-            cash = 0.0
-            position = 1
-            trades.append({"date": row["date"], "action": "買進", "price": price, "shares": shares})
-        elif position == 1 and bool(row["sell_signal"]):
-            cash = shares * price * (1 - fee_rate)
-            trades.append({"date": row["date"], "action": "賣出", "price": price, "shares": shares})
-            shares = 0.0
-            position = 0
-
-        equity_values.append(cash + shares * price)
-
-    result["position"] = 0
-    in_position = False
-    positions = []
-    for _, row in result.iterrows():
-        if bool(row["buy_signal"]) and not in_position:
-            in_position = True
-        elif bool(row["sell_signal"]) and in_position:
-            in_position = False
-        positions.append(1 if in_position else 0)
-
-    result["position"] = positions
-    result["strategy_equity"] = equity_values
-    result["buy_hold_equity"] = initial_cash * result["close"] / result["close"].iloc[0]
-    result["strategy_return"] = result["strategy_equity"].pct_change().fillna(0)
-    result["buy_hold_return"] = result["buy_hold_equity"].pct_change().fillna(0)
+    trade_cost = result["position"].diff().abs().fillna(result["position"]) * fee_rate
+    result["strategy_return"] = result["position"] * result["daily_return"] - trade_cost
+    result["strategy_equity"] = initial_cash * (1 + result["strategy_return"]).cumprod()
+    result["buy_hold_equity"] = initial_cash * (1 + result["daily_return"]).cumprod()
 
     total_return = result["strategy_equity"].iloc[-1] / initial_cash - 1
     buy_hold_return = result["buy_hold_equity"].iloc[-1] / initial_cash - 1
     days = max((result["date"].iloc[-1] - result["date"].iloc[0]).days, 1)
     annual_return = (1 + total_return) ** (365 / days) - 1
-    drawdown = result["strategy_equity"] / result["strategy_equity"].cummax() - 1
-    max_drawdown = drawdown.min()
+    max_drawdown = (result["strategy_equity"] / result["strategy_equity"].cummax() - 1).min()
     volatility = result["strategy_return"].std(ddof=0) * np.sqrt(252)
     sharpe = annual_return / volatility if volatility else 0
 
-    metrics = {
-        "total_return": total_return,
-        "buy_hold_return": buy_hold_return,
-        "annual_return": annual_return,
-        "max_drawdown": max_drawdown,
-        "sharpe": sharpe,
-        "trades": len(trades),
-        "final_equity": result["strategy_equity"].iloc[-1],
-    }
-
+    metrics = BacktestMetrics(
+        total_return=float(total_return),
+        buy_hold_return=float(buy_hold_return),
+        annual_return=float(annual_return),
+        max_drawdown=float(max_drawdown),
+        sharpe=float(sharpe),
+        trades=len(trades),
+        final_equity=float(result["strategy_equity"].iloc[-1]),
+    )
     return result, pd.DataFrame(trades), metrics
 
 
-def render_trends_panel() -> None:
-    st.subheader("Google Trends 策略熱度")
-    uploaded_file = st.file_uploader("上傳 Google Trends CSV", type=["csv"], key="trend_csv")
-    lookback = st.slider("策略評估期間", min_value=4, max_value=52, value=12, step=1)
-
-    if uploaded_file is None:
-        st.info("請上傳 Google Trends 匯出的 CSV。系統不會自動連線蒐集 Google Trends 數據。")
-        st.markdown(
-            """
-            支援 Google Trends 的 `Interest over time` CSV，或第一欄為 `date`、`day`、`week`、`month` 的一般 CSV。
-            """
-        )
-        return
-
-    try:
-        trends_df = load_trends_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"CSV 讀取失敗：{exc}")
-        return
-
-    summary_df = build_summary(trends_df, lookback)
-    long_df = build_long_table(trends_df)
-
-    if summary_df.empty or long_df.empty:
-        st.warning("CSV 中沒有足夠的數值資料可供分析。")
-        return
-
-    top_keyword = summary_df.iloc[0]
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("資料起始", str(trends_df["date"].min().date()))
-    metric_cols[1].metric("最新日期", str(trends_df["date"].max().date()))
-    metric_cols[2].metric("關鍵字數", len(summary_df))
-    metric_cols[3].metric("最高優先", top_keyword["keyword"], f"{top_keyword['score']:.1f}")
-
-    fig = px.line(
-        long_df,
-        x="date",
-        y="interest",
-        color="keyword",
-        markers=True,
-        labels={"date": "日期", "interest": "搜尋熱度", "keyword": "關鍵字"},
-    )
-    fig.update_layout(legend_title_text="", hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-    display_df = summary_df.rename(
-        columns={
-            "keyword": "關鍵字",
-            "latest": "最新熱度",
-            "previous": "前期熱度",
-            "average": "期間平均",
-            "momentum": "動能",
-            "volatility": "波動",
-            "score": "策略分數",
-            "recommendation": "建議",
-        }
-    )
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "下載趨勢策略摘要 CSV",
-        data=summary_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="trend_strategy_summary.csv",
-        mime="text/csv",
-    )
+def format_pct(value: float) -> str:
+    return f"{value:.2%}"
 
 
-def render_backtest_panel() -> None:
-    st.subheader("股票 MACD + RSI 回測")
-    stock_file = st.file_uploader("上傳股票價格 CSV", type=["csv"], key="stock_csv")
+def main() -> None:
+    st.set_page_config(page_title="Finance Strategy Backtester", page_icon="📈", layout="wide")
+    st.title("Finance Strategy Backtester")
+    st.caption("輸入股票代碼後從 Yahoo Finance 取價，並可勾選 Google Trends、MACD、RSI 進行單頁回測。")
 
-    settings = st.columns(6)
-    fast = settings[0].number_input("MACD 快線", min_value=2, max_value=50, value=12)
-    slow = settings[1].number_input("MACD 慢線", min_value=3, max_value=100, value=26)
-    signal = settings[2].number_input("MACD 訊號線", min_value=2, max_value=50, value=9)
-    rsi_period = settings[3].number_input("RSI 週期", min_value=2, max_value=50, value=14)
-    rsi_buy = settings[4].number_input("RSI 買進門檻", min_value=1, max_value=70, value=45)
-    rsi_sell = settings[5].number_input("RSI 賣出門檻", min_value=30, max_value=99, value=70)
+    with st.sidebar:
+        st.header("回測設定")
+        ticker = st.text_input("股票代碼", value="AAPL", placeholder="例如 AAPL、TSLA、2330.TW").strip().upper()
+        end_date = st.date_input("結束日期", value=date.today())
+        start_date = st.date_input("開始日期", value=date.today() - timedelta(days=365 * 3))
+        initial_cash = st.number_input("初始資金", min_value=1000, value=100000, step=1000)
+        fee_rate = st.number_input("單次換倉成本", min_value=0.0, max_value=0.05, value=0.001, step=0.0005, format="%.4f")
 
-    capital_cols = st.columns(2)
-    initial_cash = capital_cols[0].number_input("初始資金", min_value=1000, value=100000, step=1000)
-    fee_rate = capital_cols[1].number_input("單邊交易成本", min_value=0.0, max_value=0.05, value=0.001425, step=0.0001, format="%.4f")
+        st.divider()
+        st.header("技術指標")
+        use_trend = st.checkbox("Google Trends", value=True)
+        use_macd = st.checkbox("MACD", value=True)
+        use_rsi = st.checkbox("RSI", value=True)
 
-    if stock_file is None:
-        st.info("請上傳股票價格 CSV。需要 `date` 與 `close` 欄位，也可包含 open、high、low、volume。")
-        st.markdown(
-            """
-            範例：
-            ```csv
-            date,open,high,low,close,volume
-            2026-01-02,100,103,99,102,1200000
-            2026-01-03,102,105,101,104,980000
-            ```
-            """
-        )
-        return
+    trend_df = None
+    trend_column = None
+    if use_trend:
+        uploaded_file = st.file_uploader("上傳 Google Trends CSV", type=["csv"])
+        if uploaded_file is not None:
+            try:
+                trend_df = load_trends_csv(uploaded_file)
+                trend_columns = [column for column in trend_df.columns if column != "date"]
+                trend_column = st.selectbox("選擇要納入回測的 Trends 欄位", trend_columns)
+            except Exception as exc:
+                st.error(f"Google Trends CSV 讀取失敗：{exc}")
+                st.stop()
+        else:
+            st.info("你勾選了 Google Trends，請上傳 CSV；若只想用 MACD/RSI，取消勾選 Google Trends。")
+            st.stop()
 
-    if fast >= slow:
-        st.error("MACD 快線週期必須小於慢線週期。")
-        return
+    if not any([use_trend, use_macd, use_rsi]):
+        st.warning("請至少勾選一個指標。")
+        st.stop()
+
+    if not ticker:
+        st.warning("請輸入股票代碼。")
+        st.stop()
+
+    if start_date >= end_date:
+        st.error("開始日期必須早於結束日期。")
+        st.stop()
 
     try:
-        stock_df = load_stock_csv(stock_file)
-        indicator_df = add_indicators(stock_df, int(fast), int(slow), int(signal), int(rsi_period))
-        backtest_df, trades_df, metrics = backtest_macd_rsi(
+        stock_df = fetch_stock_data(ticker, start_date, end_date)
+        indicator_df = add_indicators(stock_df, trend_df, trend_column)
+        backtest_df, trades_df, metrics = run_backtest(
             indicator_df,
-            int(rsi_buy),
-            int(rsi_sell),
+            use_trend,
+            use_macd,
+            use_rsi,
             float(initial_cash),
             float(fee_rate),
         )
     except Exception as exc:
         st.error(f"回測失敗：{exc}")
-        return
+        st.stop()
 
-    metric_cols = st.columns(5)
-    metric_cols[0].metric("策略總報酬", f"{metrics['total_return']:.2%}")
-    metric_cols[1].metric("買進持有", f"{metrics['buy_hold_return']:.2%}")
-    metric_cols[2].metric("最大回撤", f"{metrics['max_drawdown']:.2%}")
-    metric_cols[3].metric("Sharpe", f"{metrics['sharpe']:.2f}")
-    metric_cols[4].metric("交易次數", metrics["trades"])
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("策略報酬", format_pct(metrics.total_return))
+    metric_cols[1].metric("買進持有", format_pct(metrics.buy_hold_return))
+    metric_cols[2].metric("年化報酬", format_pct(metrics.annual_return))
+    metric_cols[3].metric("最大回撤", format_pct(metrics.max_drawdown))
+    metric_cols[4].metric("Sharpe", f"{metrics.sharpe:.2f}")
+    metric_cols[5].metric("交易次數", metrics.trades)
 
+    st.subheader(f"{ticker} 價格與交易訊號")
     price_fig = go.Figure()
     price_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["close"], name="Close", mode="lines"))
-    buys = backtest_df[backtest_df["buy_signal"]]
-    sells = backtest_df[backtest_df["sell_signal"]]
-    price_fig.add_trace(go.Scatter(x=buys["date"], y=buys["close"], name="Buy", mode="markers", marker={"symbol": "triangle-up", "size": 11, "color": "#1a9c5b"}))
-    price_fig.add_trace(go.Scatter(x=sells["date"], y=sells["close"], name="Sell", mode="markers", marker={"symbol": "triangle-down", "size": 11, "color": "#c23b3b"}))
-    price_fig.update_layout(title="價格與交易訊號", hovermode="x unified")
+    buys = trades_df[trades_df["action"] == "Buy"] if not trades_df.empty else pd.DataFrame()
+    sells = trades_df[trades_df["action"] == "Sell"] if not trades_df.empty else pd.DataFrame()
+    if not buys.empty:
+        price_fig.add_trace(go.Scatter(x=buys["date"], y=buys["price"], name="Buy", mode="markers", marker={"symbol": "triangle-up", "size": 12, "color": "#168f5a"}))
+    if not sells.empty:
+        price_fig.add_trace(go.Scatter(x=sells["date"], y=sells["price"], name="Sell", mode="markers", marker={"symbol": "triangle-down", "size": 12, "color": "#c2413d"}))
+    price_fig.update_layout(hovermode="x unified")
     st.plotly_chart(price_fig, use_container_width=True)
 
-    chart_cols = st.columns(2)
+    st.subheader("資金曲線")
+    equity_fig = go.Figure()
+    equity_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["strategy_equity"], name="Strategy", mode="lines"))
+    equity_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["buy_hold_equity"], name="Buy & Hold", mode="lines"))
+    equity_fig.update_layout(hovermode="x unified")
+    st.plotly_chart(equity_fig, use_container_width=True)
+
+    chart_cols = st.columns(3)
     with chart_cols[0]:
+        st.write("MACD")
         macd_fig = go.Figure()
         macd_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["macd"], name="MACD", mode="lines"))
         macd_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["macd_signal"], name="Signal", mode="lines"))
-        macd_fig.add_trace(go.Bar(x=backtest_df["date"], y=backtest_df["macd_hist"], name="Histogram"))
-        macd_fig.update_layout(title="MACD", hovermode="x unified")
+        macd_fig.add_trace(go.Bar(x=backtest_df["date"], y=backtest_df["macd_hist"], name="Hist"))
+        macd_fig.update_layout(height=320, hovermode="x unified")
         st.plotly_chart(macd_fig, use_container_width=True)
 
     with chart_cols[1]:
+        st.write("RSI")
         rsi_fig = go.Figure()
         rsi_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["rsi"], name="RSI", mode="lines"))
-        rsi_fig.add_hline(y=rsi_buy, line_dash="dash", line_color="#1a9c5b")
-        rsi_fig.add_hline(y=rsi_sell, line_dash="dash", line_color="#c23b3b")
-        rsi_fig.update_layout(title="RSI", yaxis_range=[0, 100], hovermode="x unified")
+        rsi_fig.add_hline(y=50, line_dash="dash", line_color="#777")
+        rsi_fig.add_hline(y=75, line_dash="dash", line_color="#c2413d")
+        rsi_fig.update_layout(height=320, yaxis_range=[0, 100], hovermode="x unified")
         st.plotly_chart(rsi_fig, use_container_width=True)
 
-    equity_fig = px.line(
-        backtest_df,
-        x="date",
-        y=["strategy_equity", "buy_hold_equity"],
-        labels={"date": "日期", "value": "資產淨值", "variable": "策略"},
-        title="策略資產淨值 vs 買進持有",
-    )
-    st.plotly_chart(equity_fig, use_container_width=True)
+    with chart_cols[2]:
+        st.write("Google Trends")
+        trend_fig = go.Figure()
+        trend_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["trend_interest"], name="Trend", mode="lines"))
+        trend_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["trend_ma"], name="Trend MA", mode="lines"))
+        trend_fig.update_layout(height=320, hovermode="x unified")
+        st.plotly_chart(trend_fig, use_container_width=True)
 
-    st.write("交易紀錄")
-    if trades_df.empty:
-        st.warning("這組參數沒有觸發交易訊號。")
-    else:
-        st.dataframe(trades_df, use_container_width=True, hide_index=True)
+    detail_cols = st.columns(2)
+    with detail_cols[0]:
+        st.subheader("交易紀錄")
+        if trades_df.empty:
+            st.info("此期間沒有產生交易。")
+        else:
+            st.dataframe(trades_df, use_container_width=True, hide_index=True)
+
+    with detail_cols[1]:
+        st.subheader("資料預覽")
+        preview_columns = ["date", "close", "signal", "position", "macd", "macd_signal", "rsi", "trend_interest"]
+        st.dataframe(backtest_df[preview_columns].tail(30), use_container_width=True, hide_index=True)
 
     st.download_button(
-        "下載回測明細 CSV",
+        "下載回測結果 CSV",
         data=backtest_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="macd_rsi_backtest.csv",
+        file_name=f"{ticker}_backtest.csv",
         mime="text/csv",
     )
-
-
-def main() -> None:
-    st.set_page_config(page_title="Finance Strategy Trend Analyzer", page_icon="📈", layout="wide")
-
-    st.title("Finance Strategy Trend Analyzer")
-    st.caption("手動上傳 CSV，分析 Google Trends 熱度並用 MACD + RSI 進行股票回測。")
-
-    with st.sidebar:
-        st.header("資料模式")
-        st.success("手動 CSV 上傳")
-        st.caption("不自動蒐集 Google Trends 或股票價格資料。")
-
-    trend_tab, backtest_tab = st.tabs(["Google Trends 策略", "股票 MACD + RSI 回測"])
-
-    with trend_tab:
-        render_trends_panel()
-
-    with backtest_tab:
-        render_backtest_panel()
 
 
 if __name__ == "__main__":
