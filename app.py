@@ -38,7 +38,7 @@ def load_trends_csv(uploaded_file) -> pd.DataFrame:
         raise ValueError("CSV 至少需要一個日期欄位與一個趨勢數值欄位。")
 
     df = df.rename(columns={df.columns[0]: "date"})
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None).astype("datetime64[ns]")
     df = df.dropna(subset=["date"]).sort_values("date")
 
     for column in [column for column in df.columns if column != "date"]:
@@ -80,7 +80,7 @@ def fetch_stock_data(ticker: str, start: date, end: date) -> pd.DataFrame:
 
     keep_columns = [column for column in ["date", "open", "high", "low", "close", "volume"] if column in data]
     data = data[keep_columns].dropna(subset=["date", "close"])
-    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.tz_localize(None)
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.tz_localize(None).astype("datetime64[ns]")
     data["close"] = pd.to_numeric(data["close"], errors="coerce")
     data = data.dropna(subset=["date", "close"]).sort_values("date")
 
@@ -89,26 +89,38 @@ def fetch_stock_data(ticker: str, start: date, end: date) -> pd.DataFrame:
     return data
 
 
-def add_indicators(df: pd.DataFrame, trend_df: pd.DataFrame | None = None, trend_column: str | None = None) -> pd.DataFrame:
+def add_indicators(
+    df: pd.DataFrame,
+    fast_ema: int,
+    slow_ema: int,
+    signal_ema: int,
+    rsi_period: int,
+    rsi_entry_floor: int,
+    rsi_overheat_exit: int,
+    trend_df: pd.DataFrame | None = None,
+    trend_column: str | None = None,
+) -> pd.DataFrame:
     result = df.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce").dt.tz_localize(None).astype("datetime64[ns]")
     close = result["close"]
 
-    ema_fast = close.ewm(span=12, adjust=False).mean()
-    ema_slow = close.ewm(span=26, adjust=False).mean()
+    ema_fast = close.ewm(span=fast_ema, adjust=False).mean()
+    ema_slow = close.ewm(span=slow_ema, adjust=False).mean()
     result["macd"] = ema_fast - ema_slow
-    result["macd_signal"] = result["macd"].ewm(span=9, adjust=False).mean()
+    result["macd_signal"] = result["macd"].ewm(span=signal_ema, adjust=False).mean()
     result["macd_hist"] = result["macd"] - result["macd_signal"]
     result["macd_bullish"] = result["macd"] > result["macd_signal"]
 
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1 / rsi_period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / rsi_period, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     result["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
-    result["rsi_bullish"] = (result["rsi"] >= 50) & (result["rsi"] <= 75)
+    result["rsi_bullish"] = (result["rsi"] >= rsi_entry_floor) & (result["rsi"] < rsi_overheat_exit)
 
     if trend_df is not None and trend_column:
         trend = trend_df[["date", trend_column]].rename(columns={trend_column: "trend_interest"}).dropna()
+        trend["date"] = pd.to_datetime(trend["date"], errors="coerce").dt.tz_localize(None).astype("datetime64[ns]")
         trend["trend_ma"] = trend["trend_interest"].rolling(4, min_periods=1).mean()
         merged = pd.merge_asof(
             result.sort_values("date"),
@@ -209,8 +221,8 @@ def main() -> None:
     with st.sidebar:
         st.header("回測設定")
         ticker = st.text_input("股票代碼", value="AAPL", placeholder="例如 AAPL、TSLA、2330.TW").strip().upper()
-        end_date = st.date_input("結束日期", value=date.today())
-        start_date = st.date_input("開始日期", value=date.today() - timedelta(days=365 * 3))
+        start_date = st.date_input("開始時間", value=date.today() - timedelta(days=365 * 3))
+        end_date = st.date_input("結束時間", value=date.today())
         initial_cash = st.number_input("初始資金", min_value=1000, value=100000, step=1000)
         fee_rate = st.number_input("單次換倉成本", min_value=0.0, max_value=0.05, value=0.001, step=0.0005, format="%.4f")
 
@@ -219,6 +231,15 @@ def main() -> None:
         use_trend = st.checkbox("Google Trends", value=True)
         use_macd = st.checkbox("MACD", value=True)
         use_rsi = st.checkbox("RSI", value=True)
+
+        st.divider()
+        st.header("指標參數")
+        fast_ema = st.number_input("快線 EMA", min_value=2, max_value=100, value=12, step=1)
+        slow_ema = st.number_input("慢線 EMA", min_value=3, max_value=250, value=26, step=1)
+        signal_ema = st.number_input("訊號線 EMA", min_value=2, max_value=100, value=9, step=1)
+        rsi_period = st.number_input("RSI 週期", min_value=2, max_value=100, value=14, step=1)
+        rsi_entry_floor = st.number_input("RSI 進場下限", min_value=1, max_value=99, value=50, step=1)
+        rsi_overheat_exit = st.number_input("RSI 過熱出場", min_value=1, max_value=100, value=75, step=1)
 
     trend_df = None
     trend_column = None
@@ -248,9 +269,27 @@ def main() -> None:
         st.error("開始日期必須早於結束日期。")
         st.stop()
 
+    if fast_ema >= slow_ema:
+        st.error("快線 EMA 必須小於慢線 EMA。")
+        st.stop()
+
+    if rsi_entry_floor >= rsi_overheat_exit:
+        st.error("RSI 進場下限必須小於 RSI 過熱出場。")
+        st.stop()
+
     try:
         stock_df = fetch_stock_data(ticker, start_date, end_date)
-        indicator_df = add_indicators(stock_df, trend_df, trend_column)
+        indicator_df = add_indicators(
+            stock_df,
+            int(fast_ema),
+            int(slow_ema),
+            int(signal_ema),
+            int(rsi_period),
+            int(rsi_entry_floor),
+            int(rsi_overheat_exit),
+            trend_df,
+            trend_column,
+        )
         backtest_df, trades_df, metrics = run_backtest(
             indicator_df,
             use_trend,
@@ -304,8 +343,8 @@ def main() -> None:
         st.write("RSI")
         rsi_fig = go.Figure()
         rsi_fig.add_trace(go.Scatter(x=backtest_df["date"], y=backtest_df["rsi"], name="RSI", mode="lines"))
-        rsi_fig.add_hline(y=50, line_dash="dash", line_color="#777")
-        rsi_fig.add_hline(y=75, line_dash="dash", line_color="#c2413d")
+        rsi_fig.add_hline(y=rsi_entry_floor, line_dash="dash", line_color="#777")
+        rsi_fig.add_hline(y=rsi_overheat_exit, line_dash="dash", line_color="#c2413d")
         rsi_fig.update_layout(height=320, yaxis_range=[0, 100], hovermode="x unified")
         st.plotly_chart(rsi_fig, use_container_width=True)
 

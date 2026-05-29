@@ -8,6 +8,7 @@
 - Yahoo Finance 自動取得股價資料
 - Google Trends 維持手動上傳 CSV，不自動抓取 Google Trends
 - 可勾選使用 Google Trends、MACD、RSI
+- 可自行調整快線 EMA、慢線 EMA、訊號線 EMA、RSI 週期、RSI 進場下限、RSI 過熱出場
 - 顯示策略報酬、買進持有報酬、年化報酬、最大回撤、Sharpe、交易次數
 - 顯示價格訊號、資金曲線、MACD、RSI、Google Trends 圖表
 
